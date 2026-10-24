@@ -1,0 +1,223 @@
+name: Build ChatGate IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: |
+          brew install xcodegen || true
+          which xcodegen || brew install xcodegen
+
+      - name: Environment
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcodegen --version
+          echo "CPU=$(sysctl -n hw.ncpu)"
+          echo "Memory=$(sysctl -n hw.memsize | awk '{printf "%.0f GB", $1/1073741824}')"
+
+      - name: Generate Xcode Project
+        run: |
+          xcodegen generate
+          echo "================ resolved build settings ================"
+          xcodebuild -project ChatGate.xcodeproj -scheme ChatGate -configuration Release \
+            -showBuildSettings 2>/dev/null | \
+            grep -i "INFOPLIST_FILE\|GENERATE_INFOPLIST\|MARKETING_VERSION\|CURRENT_PROJECT_VERSION\|PRODUCT_NAME =\|PRODUCT_BUNDLE_IDENTIFIER" | head -20
+          echo "================ Info.plist file reference ================"
+          grep -n "Info.plist" ChatGate.xcodeproj/project.pbxproj | head -10
+
+      - name: Archive (unsigned)
+        run: |
+          set +e
+          xcodebuild -project ChatGate.xcodeproj -scheme ChatGate \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath build/ChatGate.xcarchive archive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            > /tmp/xcode.log 2>&1
+          EX=$?
+          set -e
+          echo "================ xcodebuild exit=$EX ================"
+          if [ $EX -ne 0 ]; then
+            echo "================ Swift error lines (dedup) ================"
+            grep -E "error:" /tmp/xcode.log | sed 's/\.|/;/g' | sed 's|/Users/runner/work/chatgate-ios/chatgate-ios/||' | sort -u | head -80 || true
+            echo "================ xcodebuild last 100 lines ================"
+            tail -100 /tmp/xcode.log
+            exit $EX
+          fi
+          cp /tmp/xcode.log build/xcode.log 2>/dev/null || true
+
+      - name: Preflight - archive sanity
+        run: |
+          COUNT=$(python3 -c "print(open('ChatGate.xcodeproj/project.pbxproj').read().count('.swift'))")
+          echo "swift refs: $COUNT"
+          if [ "$COUNT" -lt 15 ]; then
+            echo "FATAL: too few swift refs ($COUNT) - xcodegen 可能没把 Swift 源文件收进 target"
+            exit 1
+          fi
+          APP=build/ChatGate.xcarchive/Products/Applications/ChatGate.app
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          test -d "$APP" || { echo "FATAL: app not in archive"; exit 1; }
+          test -f "$APP/ChatGate" || { echo "FATAL: binary missing"; exit 1; }
+          test -f "$APP/Assets.car" || { echo "FATAL: Assets.car missing"; exit 1; }
+          SZ=$(stat -f%z "$APP/Assets.car" 2>/dev/null || stat -c%s "$APP/Assets.car")
+          echo "Assets.car size: $SZ"
+          if [ "$SZ" -lt 100000 ]; then
+            echo "FATAL: Assets.car too small ($SZ) - 图标/素材没进包"
+            exit 1
+          fi
+          test -f "$APP/AppIcon60x60@2x.png" || { echo "FATAL: app icon png missing"; exit 1; }
+          if strings -a "$APP/ChatGate" | grep -q "ChatGate"; then
+            echo "feature string in binary: OK"
+          else
+            echo "FATAL: feature string missing"; exit 1
+          fi
+          strings -a "$APP/ChatGate" | grep -E "ChatGate|OpenAI|ChatGPT|LobeChat" | sort -u
+          du -h "$APP" | tail -1
+          echo "Preflight OK"
+
+      - name: Fix Info.plist (规范值硬编码，不依赖仓库 plist)
+        run: |
+          cat > /tmp/fixplist.py <<'PYEOF'
+          import plistlib, sys
+
+          app_path, mv, bv = sys.argv[1], sys.argv[2], sys.argv[3]
+          app = plistlib.load(open(app_path, 'rb'))
+
+          canon = {
+              'CFBundleDevelopmentRegion': 'zh_CN',
+              'CFBundleDisplayName': 'ChatGate',
+              'CFBundleExecutable': app.get('CFBundleExecutable') or 'ChatGate',
+              'CFBundleIdentifier': app.get('CFBundleIdentifier') or 'com.qingyao.chatgate',
+              'CFBundleInfoDictionaryVersion': '6.0',
+              'CFBundleName': 'ChatGate',
+              'CFBundlePackageType': 'APPL',
+              'CFBundleShortVersionString': mv,
+              'CFBundleVersion': bv,
+              'UIRequiredDeviceCapabilities': ['arm64'],
+              'UISupportedInterfaceOrientations': [
+                  'UIInterfaceOrientationPortrait',
+                  'UIInterfaceOrientationLandscapeLeft',
+                  'UIInterfaceOrientationLandscapeRight',
+              ],
+              'UILaunchScreen': {'UIColorName': 'LaunchBackground'},
+              'NSLocalNetworkUsageDescription':
+                  'ChatGate 需要本地网络权限，让同一 WiFi 下的第三方软件（Cherry Studio、LobeChat 等）连接本机网关 API。',
+              'NSAppTransportSecurity': {'NSAllowsLocalNetworking': True},
+              'UIBackgroundModes': ['audio'],
+          }
+          drop = {'CFBundleIcons', 'CFBundleIcons~ipad'}
+          merged = {k: v for k, v in app.items() if k not in canon and k not in drop}
+          merged.update(canon)
+          with open(app_path, 'wb') as f:
+              plistlib.dump(merged, f)
+          print('rewritten keys = %d' % len(merged))
+          ok = True
+          for k in canon:
+              v = merged.get(k)
+              if v != canon[k]:
+                  print('  MISMATCH %s: %r' % (k, v))
+                  ok = False
+          print('self-check:', 'PASS' if ok else 'FAIL')
+          sys.exit(0 if ok else 1)
+          PYEOF
+          MV=$(grep -m1 'MARKETING_VERSION' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
+          BV=$(grep -m1 'CURRENT_PROJECT_VERSION' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
+          [ -z "$MV" ] && MV=1.0.0
+          [ -z "$BV" ] && BV=1
+          echo "MV=$MV BV=$BV"
+          python3 /tmp/fixplist.py "$APP/Info.plist" "$MV" "$BV"
+          echo "$MV" > /tmp/mv.txt
+          echo "$BV" > /tmp/bv.txt
+
+      - name: Guard - verify final plist
+        run: |
+          cat > /tmp/check.py <<'PYEOF'
+          import plistlib, sys
+          p = plistlib.load(open(sys.argv[1], 'rb'))
+          fails = []
+          need = {
+              'CFBundleDisplayName': 'ChatGate',
+              'CFBundleName': 'ChatGate',
+              'CFBundleIdentifier': 'com.qingyao.chatgate',
+              'CFBundleShortVersionString': open('/tmp/mv.txt').read().strip(),
+              'CFBundleVersion': open('/tmp/bv.txt').read().strip(),
+          }
+          for k, want in need.items():
+              got = p.get(k)
+              if got != want:
+                  fails.append('%s: got %r want %r' % (k, got, want))
+          for k in ('UILaunchScreen', 'NSLocalNetworkUsageDescription', 'NSAppTransportSecurity'):
+              if k not in p:
+                  fails.append('missing %s' % k)
+          if p.get('UIBackgroundModes') != ['audio']:
+              fails.append('UIBackgroundModes = %r' % (p.get('UIBackgroundModes'),))
+          if not str(p.get('CFBundleName', '')).startswith('ChatGate'):
+              fails.append('CFBundleName placeholder unresolved: %r' % (p.get('CFBundleName'),))
+          print('plist keys: %d' % len(p))
+          print('sorted:', ', '.join(sorted(p)))
+          if fails:
+              print('FATAL: plist drift')
+              [print('  -', f) for f in fails]
+              sys.exit(1)
+          print('plist complete')
+          PYEOF
+          python3 /tmp/check.py "$APP/Info.plist"
+          SZ=$(wc -c < "$APP/Info.plist")
+          echo "Info.plist bytes: $SZ"
+          echo "Guard OK"
+
+      - name: Export IPA
+        run: |
+          rm -rf build/ipa
+          mkdir -p build/ipa/Payload
+          cp -R build/ChatGate.xcarchive/Products/Applications/ChatGate.app build/ipa/Payload/
+          cd build/ipa && zip -qry ../ChatGate-unsigned.ipa Payload && cd ../..
+          ls -la build/*.ipa
+          md5sum build/ChatGate-unsigned.ipa
+
+      - name: Read version
+        run: |
+          MV=$(cat /tmp/mv.txt)
+          BV=$(cat /tmp/bv.txt)
+          echo ">> version=$MV($BV)"
+          echo "version=$MV($BV)" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChatGate-ipa
+          path: build/ChatGate-unsigned.ipa
+
+      - name: Upload xcode build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChatGate-xcode-log
+          path: build/xcode.log
+          if-no-files-found: ignore
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.version }}
+          name: ChatGate v${{ env.version }}
+          files: build/ChatGate-unsigned.ipa
+          body: |
+            ChatGate — ChatGPT 网页版 → OpenAI 兼容 API 网关（本地服务 + 工具调用）
+
+            版本 ${{ env.version }}
+            未签名 IPA，用 Feather / AltStore 签名后即可安装。
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
